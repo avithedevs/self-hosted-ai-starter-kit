@@ -1,0 +1,258 @@
+{
+  "name": "Slack Market Q&A",
+  "active": false,
+  "settings": {
+    "timezone": "Europe/Amsterdam"
+  },
+  "nodes": [
+    {
+      "id": "1",
+      "name": "Slack Trigger",
+      "type": "n8n-nodes-base.slackTrigger",
+      "typeVersion": 1,
+      "position": [ -920, -40 ],
+      "parameters": {
+        "event": [
+          "app_mention",
+          "message.im"
+        ]
+      }
+    },
+    {
+      "id": "2",
+      "name": "ParseIntent",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [ -680, -40 ],
+      "parameters": {
+        "language": "JavaScript",
+        "jsCode": "const text = ($json.text || '').trim();\nconst up = text.toUpperCase();\nconst m = up.match(/(?:^|\\s)\\$?([A-Z]{1,5})(?:\\s|$)/);\nconst ticker = m ? m[1] : null;\nconst macroTerms = ['MACRO','ECON','ECONOMIC','CALENDAR','DATA'];\nconst askMacro = macroTerms.some(t => up.includes(t)) && up.includes('TODAY');\nlet intent = 'fallback';\nif (ticker && /(PRICE|UPDATE|QUOTE|WHAT|HOW|UP|DOWN)/.test(up)) intent = 'ticker_update';\nelse if (askMacro) intent = 'us_macro_today';\nreturn [{ json: { intent, ticker, date: new Date().toISOString().slice(0,10), channel: $json.channel, user: $json.user, original: text } }];"
+      }
+    },
+    {
+      "id": "3",
+      "name": "Route Intent",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 1,
+      "position": [ -470, -40 ],
+      "parameters": {
+        "value1": "={{$json.intent}}",
+        "dataType": "string",
+        "rules": [
+          { "operation": "equal", "value2": "ticker_update" },
+          { "operation": "equal", "value2": "us_macro_today" }
+        ]
+      }
+    },
+    {
+      "id": "4",
+      "name": "FinnhubQuote",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [ -250, -160 ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://finnhub.io/api/v1/quote",
+        "responseFormat": "json",
+        "options": { "ignoreResponseCode": true },
+        "queryParametersUi": {
+          "parameter": [
+            { "name": "symbol", "value": "={{$items('ParseIntent',0,0).json.ticker}}" },
+            { "name": "token", "value": "={{$env.FINNHUB_API_KEY}}" }
+          ]
+        }
+      }
+    },
+    {
+      "id": "5",
+      "name": "IF Finnhub OK",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [ -60, -160 ],
+      "parameters": {
+        "conditions": {
+          "number": [
+            { "value1": "={{$json[\"c\"]}}", "operation": "larger", "value2": 0 }
+          ]
+        }
+      }
+    },
+    {
+      "id": "6",
+      "name": "AlphaVantageQuote (fallback)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [ -60, 40 ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://www.alphavantage.co/query",
+        "responseFormat": "json",
+        "options": { "ignoreResponseCode": true },
+        "queryParametersUi": {
+          "parameter": [
+            { "name": "function", "value": "GLOBAL_QUOTE" },
+            { "name": "symbol", "value": "={{$items('ParseIntent',0,0).json.ticker}}" },
+            { "name": "apikey", "value": "={{$env.ALPHAVANTAGE_API_KEY}}" }
+          ]
+        }
+      }
+    },
+    {
+      "id": "7",
+      "name": "FinnhubEconCalendar",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [ -250, 260 ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://finnhub.io/api/v1/calendar/economic",
+        "responseFormat": "json",
+        "options": { "ignoreResponseCode": true },
+        "queryParametersUi": {
+          "parameter": [
+            { "name": "from", "value": "={{$items('ParseIntent',0,0).json.date}}" },
+            { "name": "to", "value": "={{$items('ParseIntent',0,0).json.date}}" },
+            { "name": "token", "value": "={{$env.FINNHUB_API_KEY}}" }
+          ]
+        }
+      }
+    },
+    {
+      "id": "8",
+      "name": "FormatData",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [ 150, 40 ],
+      "parameters": {
+        "language": "JavaScript",
+        "jsCode": "const root = $items('ParseIntent',0,0).json;\nconst intent = root.intent;\nconst channel = root.channel;\nconst ticker = root.ticker;\nif (intent === 'ticker_update') {\n  const fin = $items('FinnhubQuote',0,0)?.json || {};\n  const av  = $items('AlphaVantageQuote (fallback)',0,0)?.json || {};\n  let out;\n  if (fin.c) {\n    out = { source:'finnhub', ticker, price: fin.c, change: fin.d, percent: fin.dp, high: fin.h, low: fin.l, open: fin.o, prevClose: fin.pc };\n  } else if (av['Global Quote']) {\n    const g = av['Global Quote'];\n    out = { source:'alphavantage', ticker: g['01. symbol'] || ticker, price: Number(g['05. price']), change: Number(g['09. change']), percent: Number((g['10. change percent']||'0').replace('%','')), high: Number(g['03. high']), low: Number(g['04. low']), open: Number(g['02. open']), prevClose: Number(g['08. previous close']) };\n  } else {\n    out = { error: 'No price data' };\n  }\n  return [{ json: { intent, channel, formatted: out } }];\n}\nif (intent === 'us_macro_today') {\n  const cal = $items('FinnhubEconCalendar',0,0)?.json || {};\n  const tz = $env.TIMEZONE || 'Europe/Amsterdam';\n  const list = (cal.economicCalendar || cal.result || []);\n  const events = list.map(e => ({\n    time_local: new Date(e.time || e.datetime).toLocaleTimeString('en-US', { timeZone: tz, hour: '2-digit', minute: '2-digit' }),\n    event: e.event || e.title,\n    country: e.country || 'US',\n    actual: e.actual || e.actual_value || null,\n    forecast: e.estimate || e.forecast || null,\n    previous: e.previous || null,\n    importance: e.importance || e.impact || null\n  }));\n  return [{ json: { intent, channel, formatted: { date: root.date, events } } }];\n}\nreturn [{ json: { intent: 'fallback', channel, formatted: { note: 'Unsupported query' } } }];"
+      }
+    },
+    {
+      "id": "9",
+      "name": "OpenAI Chat",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [ 360, 40 ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "responseFormat": "json",
+        "options": {},
+        "headerParametersUi": {
+          "parameter": [
+            { "name": "Authorization", "value": "={{'Bearer ' + $env.OPENAI_API_KEY}}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "jsonParameters": true,
+        "bodyParametersJson": "={{JSON.stringify({model:'gpt-4o-mini',temperature:0.2,messages:[{role:'system',content:'You are a precise market assistant. Short, numeric, no hype.'},{role:'user',content:`Answer the Slack request. Intent: ${$json.intent}. Data JSON: ${JSON.stringify($json.formatted)}. For ticker_update include last price, absolute and percent change, and day high/low if present. For us_macro_today bullet key releases with local times and expected vs prior. Max 120 words.`}]})}}"
+      }
+    },
+    {
+      "id": "10",
+      "name": "ExtractAnswer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [ 560, 40 ],
+      "parameters": {
+        "language": "JavaScript",
+        "jsCode": "const channel = $items('FormatData',0,0).json.channel;\nconst choices = $json.choices || [];\nconst text = choices[0]?.message?.content || $json.text || JSON.stringify($json);\nreturn [{ json: { channel, text } }];"
+      }
+    },
+    {
+      "id": "11",
+      "name": "Slack Post Message",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 1,
+      "position": [ 770, 40 ],
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channel": "={{$json.channel}}",
+        "text": "={{$json.text}}"
+      }
+    }
+  ],
+  "connections": {
+    "Slack Trigger": {
+      "main": [
+        [
+          { "node": "ParseIntent", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "ParseIntent": {
+      "main": [
+        [
+          { "node": "Route Intent", "type": "main", "index": 0 }
+        ],
+        [
+          { "node": "FormatData", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Route Intent": {
+      "main": [
+        [
+          { "node": "FinnhubQuote", "type": "main", "index": 0 }
+        ],
+        [
+          { "node": "FinnhubEconCalendar", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "FinnhubQuote": {
+      "main": [
+        [
+          { "node": "IF Finnhub OK", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "IF Finnhub OK": {
+      "main": [
+        [
+          { "node": "FormatData", "type": "main", "index": 0 }
+        ],
+        [
+          { "node": "AlphaVantageQuote (fallback)", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "AlphaVantageQuote (fallback)": {
+      "main": [
+        [
+          { "node": "FormatData", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "FinnhubEconCalendar": {
+      "main": [
+        [
+          { "node": "FormatData", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "FormatData": {
+      "main": [
+        [
+          { "node": "OpenAI Chat", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "OpenAI Chat": {
+      "main": [
+        [
+          { "node": "ExtractAnswer", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "ExtractAnswer": {
+      "main": [
+        [
+          { "node": "Slack Post Message", "type": "main", "index": 0 }
+        ]
+      ]
+    }
+  }
+}
